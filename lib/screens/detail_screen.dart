@@ -7,7 +7,7 @@ library;
 
 import 'package:flutter/material.dart';
 
-import '../database/database_helper.dart';
+import '../app_scope.dart';
 import '../database/recipe_repository.dart';
 import '../models/recipe_entry.dart';
 import '../services/media_service.dart';
@@ -30,7 +30,7 @@ class DetailScreen extends StatefulWidget {
     this.speechOutput,
   });
 
-  /// Repositorio de recetas; por defecto [DatabaseHelper.instance].
+  /// Repositorio de recetas; por defecto el de [AppScope].
   final RecipeRepository? repository;
 
   /// Almacén de imágenes; por defecto [MediaService].
@@ -45,7 +45,7 @@ class DetailScreen extends StatefulWidget {
 
 class _DetailScreenState extends State<DetailScreen> {
   late final RecipeRepository _repository =
-      widget.repository ?? DatabaseHelper.instance;
+      widget.repository ?? AppScope.of(context).recipes;
   late final ImageStorage _images = widget.imageStorage ?? MediaService();
   late final RecipeNarrator _narrator = RecipeNarrator(
     widget.speechOutput ?? VoiceService(),
@@ -70,17 +70,17 @@ class _DetailScreenState extends State<DetailScreen> {
   /// Marca o desmarca la receta como favorita y actualiza la vista.
   Future<void> _toggleFavorite() async {
     final recipe = _recipe!;
-    final id = recipe.id;
-    if (id == null) return;
     final messenger = ScaffoldMessenger.of(context);
     try {
-      final newValue = await _repository.toggleFavorite(id, recipe.isFavorite);
+      final updated = await _repository.toggleFavorite(recipe);
       if (!mounted) return;
-      setState(() => _recipe = recipe.copyWith(isFavorite: newValue));
+      setState(() => _recipe = updated);
       messenger.showSnackBar(
         SnackBar(
           content: Text(
-            newValue == 1 ? 'Agregada a favoritas' : 'Quitada de favoritas',
+            updated.isFavorite
+                ? 'Agregada a favoritas'
+                : 'Quitada de favoritas',
           ),
           duration: const Duration(seconds: 1),
         ),
@@ -109,11 +109,22 @@ class _DetailScreenState extends State<DetailScreen> {
     }
   }
 
+  /// Abre el formulario en modo edición y refresca la vista al volver.
+  Future<void> _edit() async {
+    await _narrator.stop();
+    if (!mounted) return;
+    final updated = await Navigator.pushNamed<Object?>(
+      context,
+      '/create',
+      arguments: _recipe,
+    );
+    if (!mounted || updated is! RecipeEntry) return;
+    setState(() => _recipe = updated);
+  }
+
   /// Pide confirmación, borra la receta y su foto, y vuelve a la lista.
   Future<void> _delete() async {
     final recipe = _recipe!;
-    final id = recipe.id;
-    if (id == null) return;
 
     final confirmed = await showDialog<bool>(
       context: context,
@@ -138,8 +149,10 @@ class _DetailScreenState extends State<DetailScreen> {
     final navigator = Navigator.of(context);
     try {
       await _narrator.stop();
-      await _repository.deleteRecipe(id);
-      await _images.deleteImage(recipe.imagePath);
+      // Borrado lógico: se propaga a otros dispositivos en la próxima sync.
+      await _repository.deleteRecipe(recipe.id);
+      final path = recipe.imagePath;
+      if (path != null) await _images.deleteImage(path);
       messenger.showSnackBar(const SnackBar(content: Text('Receta eliminada')));
       navigator.pop(true);
     } catch (e) {
@@ -171,6 +184,11 @@ class _DetailScreenState extends State<DetailScreen> {
                 onPressed: _toggleFavorite,
               ),
               IconButton(
+                tooltip: 'Editar',
+                icon: const Icon(Icons.edit_outlined),
+                onPressed: _edit,
+              ),
+              IconButton(
                 tooltip: 'Eliminar',
                 icon: const Icon(Icons.delete_outline),
                 onPressed: _delete,
@@ -200,7 +218,7 @@ class _DetailScreenState extends State<DetailScreen> {
                   children: [
                     Chip(
                       avatar: Icon(Icons.category_outlined, color: accent),
-                      label: Text(recipe.category),
+                      label: Text(recipe.categoryName),
                     ),
                     Chip(
                       avatar: Icon(Icons.timer_outlined, color: accent),

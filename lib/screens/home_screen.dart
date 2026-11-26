@@ -1,15 +1,23 @@
-/// Pantalla principal (ruta `/`): lista de recetas con filtros.
+/// Pantalla principal: lista de recetas del usuario con filtros.
 ///
 /// **SRP:** la pantalla solo dibuja estados y navega; cada filtro sabe cómo
-/// consultarse y qué mensaje mostrar cuando no hay resultados.
+/// consultarse y qué mensaje mostrar cuando no hay resultados. Lee siempre
+/// de [RecipeRepository] (SQLite local); la sincronización corre aparte.
 library;
+
+import 'dart:async';
 
 import 'package:flutter/material.dart';
 
-import '../database/database_helper.dart';
+import '../app_scope.dart';
 import '../database/recipe_repository.dart';
+import '../models/recipe_category.dart';
 import '../models/recipe_entry.dart';
+import '../models/sync_state.dart';
+import '../services/auth_repository.dart';
+import '../widgets/category_icon.dart';
 import '../widgets/recipe_card.dart';
+import '../widgets/sync_status_indicator.dart';
 
 /// Filtro del Drawer.
 ///
@@ -86,39 +94,43 @@ final class _FavoritesFilter extends _RecipeFilter {
 final class _CategoryFilter extends _RecipeFilter {
   const _CategoryFilter(this.category);
 
-  /// Categoría filtrada, una de [kRecipeCategories].
-  final String category;
+  /// Categoría filtrada (fila de la tabla `categories`).
+  final RecipeCategory category;
 
   @override
-  String get title => category;
+  String get title => category.name;
   @override
-  String get emptyTitle => 'No hay recetas en "$category"';
+  String get emptyTitle => 'No hay recetas en "${category.name}"';
   @override
   String get emptySubtitle =>
       'Crea una receta de esta categoría o elige otro filtro.';
   @override
   Future<List<RecipeEntry>> load(RecipeRepository repository) =>
-      repository.getRecipesByCategory(category);
+      repository.getRecipesByCategory(category.id);
 
   @override
   bool operator ==(Object other) =>
-      other is _CategoryFilter && other.category == category;
+      other is _CategoryFilter && other.category.id == category.id;
   @override
-  int get hashCode => category.hashCode;
+  int get hashCode => category.id.hashCode;
 }
 
-/// Lista de recetas cargada con `FutureBuilder`, con Drawer de filtros y
-/// botón para crear recetas.
+/// Lista de recetas cargada con `FutureBuilder`, con Drawer de filtros,
+/// deslizar para sincronizar, indicador de sincronización y cierre de sesión.
 ///
-/// **DIP:** depende de [RecipeRepository]; si no se inyecta usa
-/// [DatabaseHelper.instance].
+/// **DIP:** depende de [RecipeRepository] y [AuthRepository]; si no se
+/// inyectan se toman de [AppScope].
 class HomeScreen extends StatefulWidget {
-  /// Crea la pantalla. [repository] permite sustituir la base de datos real
-  /// (por ejemplo, en pruebas).
-  const HomeScreen({super.key, this.repository});
+  /// Crea la pantalla. Los parámetros permiten sustituir las
+  /// implementaciones reales (por ejemplo, en pruebas).
+  const HomeScreen({super.key, this.repository, this.auth});
 
-  /// Repositorio de recetas; por defecto [DatabaseHelper.instance].
+  /// Repositorio de recetas; por defecto el de [AppScope].
   final RecipeRepository? repository;
+
+  /// Autenticación (para cerrar sesión); por defecto la de [AppScope]. Si no
+  /// hay ninguna, se oculta el botón de salir.
+  final AuthRepository? auth;
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -126,15 +138,32 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   late final RecipeRepository _db =
-      widget.repository ?? DatabaseHelper.instance;
+      widget.repository ?? AppScope.of(context).recipes;
+  late final AuthRepository? _auth =
+      widget.auth ?? AppScope.maybeOf(context)?.auth;
 
   _RecipeFilter _filter = const _AllFilter();
   late Future<List<RecipeEntry>> _recipesFuture;
+  late Future<List<RecipeCategory>> _categoriesFuture;
+  StreamSubscription<void>? _remoteChangesSub;
 
   @override
   void initState() {
     super.initState();
     _recipesFuture = _loadRecipes();
+    _categoriesFuture = _db.getCategories();
+    // Si un pull trae cambios del servidor, se recargan lista y categorías.
+    _remoteChangesSub = _db.remoteChanges.listen((_) {
+      if (!mounted) return;
+      _categoriesFuture = _db.getCategories();
+      _reload();
+    });
+  }
+
+  @override
+  void dispose() {
+    _remoteChangesSub?.cancel();
+    super.dispose();
   }
 
   Future<List<RecipeEntry>> _loadRecipes() => _filter.load(_db);
@@ -158,7 +187,56 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _openCreate() async {
     final created = await Navigator.pushNamed(context, '/create');
     if (!mounted) return;
-    if (created == true) _reload();
+    if (created != null) _reload();
+  }
+
+  /// Sincroniza con el servidor y recarga; si falla lo avisa.
+  Future<void> _sync() async {
+    final messenger = ScaffoldMessenger.of(context);
+    await _db.syncAll();
+    if (!mounted) return;
+    _reload();
+    final state = _db.syncState.value;
+    final message = switch (state.phase) {
+      SyncPhase.offline =>
+        'Sin conexión. Tus cambios se subirán al reconectar.',
+      SyncPhase.error => state.message ?? 'No se pudo sincronizar.',
+      _ => null,
+    };
+    if (message != null) {
+      messenger.showSnackBar(SnackBar(content: Text(message)));
+    }
+  }
+
+  /// Pide confirmación y cierra la sesión.
+  Future<void> _signOut() async {
+    final auth = _auth;
+    if (auth == null) return;
+    final pending = _db.syncState.value.pendingCount;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Cerrar sesión'),
+        content: Text(
+          pending > 0
+              ? 'Tienes $pending cambio(s) sin sincronizar. Se conservarán en '
+                    'este dispositivo y se subirán cuando vuelvas a entrar.'
+              : '¿Deseas cerrar la sesión?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancelar'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Salir'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await auth.signOut();
   }
 
   /// Abre el detalle de [recipe] y recarga la lista al volver.
@@ -171,11 +249,9 @@ class _HomeScreenState extends State<HomeScreen> {
 
   /// Invierte el favorito de [recipe] desde la tarjeta de la lista.
   Future<void> _toggleFavorite(RecipeEntry recipe) async {
-    final id = recipe.id;
-    if (id == null) return;
     final messenger = ScaffoldMessenger.of(context);
     try {
-      await _db.toggleFavorite(id, recipe.isFavorite);
+      await _db.toggleFavorite(recipe);
       if (!mounted) return;
       _reload();
     } catch (e) {
@@ -186,11 +262,23 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: Text(_filter.title)),
+      appBar: AppBar(
+        title: Text(_filter.title),
+        actions: [
+          SyncStatusIndicator(state: _db.syncState, onSync: _sync),
+          if (_auth != null)
+            IconButton(
+              tooltip: 'Cerrar sesión',
+              icon: const Icon(Icons.logout),
+              onPressed: _signOut,
+            ),
+        ],
+      ),
       drawer: _buildDrawer(context),
       body: RefreshIndicator(
+        // Deslizar hacia abajo sincroniza con el servidor y recarga.
         onRefresh: () async {
-          _reload();
+          await _sync();
           await _recipesFuture.catchError((_) => <RecipeEntry>[]);
         },
         child: FutureBuilder<List<RecipeEntry>>(
@@ -271,8 +359,9 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                 ),
                 Text(
-                  'Tu recetario interactivo',
+                  _auth?.currentUserEmail ?? 'Tu recetario interactivo',
                   style: theme.textTheme.bodySmall,
+                  overflow: TextOverflow.ellipsis,
                 ),
               ],
             ),
@@ -284,10 +373,34 @@ class _HomeScreenState extends State<HomeScreen> {
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
             child: Text('Categorías', style: theme.textTheme.labelLarge),
           ),
-          tile(Icons.free_breakfast, const _CategoryFilter('Desayuno')),
-          tile(Icons.dinner_dining, const _CategoryFilter('Plato Fuerte')),
-          tile(Icons.cake, const _CategoryFilter('Postre')),
-          tile(Icons.local_bar, const _CategoryFilter('Bebida')),
+          // Las categorías vienen de la tabla `categories`.
+          FutureBuilder<List<RecipeCategory>>(
+            future: _categoriesFuture,
+            builder: (context, snapshot) {
+              if (snapshot.hasError) {
+                return const ListTile(
+                  leading: Icon(Icons.error_outline),
+                  title: Text('No se pudieron cargar las categorías'),
+                );
+              }
+              final categories = snapshot.data;
+              if (categories == null) {
+                return const Padding(
+                  padding: EdgeInsets.all(16),
+                  child: Center(child: CircularProgressIndicator()),
+                );
+              }
+              return Column(
+                children: [
+                  for (final category in categories)
+                    tile(
+                      categoryIcon(category.icon),
+                      _CategoryFilter(category),
+                    ),
+                ],
+              );
+            },
+          ),
         ],
       ),
     );

@@ -28,14 +28,30 @@ class RecipeImage extends StatelessWidget {
       ),
     );
 
-    if (recipe.imagePath.isEmpty) return placeholder;
+    // 1) Foto local en disco, 2) URL pública de Supabase, 3) marcador.
+    final network = recipe.imageUrl;
+    final Widget remoteOrPlaceholder = network == null
+        ? placeholder
+        : Image.network(
+            network,
+            fit: BoxFit.cover,
+            width: double.infinity,
+            height: double.infinity,
+            loadingBuilder: (context, child, progress) =>
+                progress == null ? child : placeholder,
+            errorBuilder: (_, _, _) => placeholder,
+          );
+
+    final path = recipe.imagePath;
+    if (path == null) return remoteOrPlaceholder;
 
     return Image.file(
-      File(recipe.imagePath),
+      File(path),
       fit: BoxFit.cover,
       width: double.infinity,
       height: double.infinity,
-      errorBuilder: (_, _, _) => placeholder,
+      // Si el archivo local ya no existe se recurre a la copia remota.
+      errorBuilder: (_, _, _) => remoteOrPlaceholder,
     );
   }
 }
@@ -83,6 +99,26 @@ class RecipeCard extends StatelessWidget {
                     tag: recipe.heroTag,
                     child: RecipeImage(recipe: recipe),
                   ),
+                  if (recipe.isPending)
+                    const Positioned(
+                      top: 8,
+                      left: 8,
+                      child: Tooltip(
+                        message: 'Pendiente de sincronizar',
+                        child: Material(
+                          color: Colors.black54,
+                          shape: CircleBorder(),
+                          child: Padding(
+                            padding: EdgeInsets.all(8),
+                            child: Icon(
+                              Icons.cloud_upload_outlined,
+                              size: 20,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
                   Positioned(
                     top: 8,
                     right: 8,
@@ -124,7 +160,7 @@ class RecipeCard extends StatelessWidget {
                     children: [
                       _InfoChip(
                         icon: Icons.category_outlined,
-                        label: recipe.category,
+                        label: recipe.categoryName,
                       ),
                       _InfoChip(
                         icon: Icons.timer_outlined,

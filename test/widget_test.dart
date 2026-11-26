@@ -1,22 +1,34 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:m02_proyecto1/database/recipe_repository.dart';
+import 'package:m02_proyecto1/models/ingredient.dart';
+import 'package:m02_proyecto1/models/recipe_category.dart';
 import 'package:m02_proyecto1/models/recipe_entry.dart';
+import 'package:m02_proyecto1/models/sync_state.dart';
 import 'package:m02_proyecto1/screens/home_screen.dart';
 import 'package:m02_proyecto1/services/recipe_narrator.dart';
 import 'package:m02_proyecto1/services/voice_service.dart';
 import 'package:m02_proyecto1/widgets/recipe_card.dart';
 
-const _recipe = RecipeEntry(
-  id: 7,
+final _created = DateTime.utc(2026, 11, 12, 10);
+
+final _desayuno = kDefaultCategories[0];
+final _bebida = kDefaultCategories[3];
+
+final _recipe = RecipeEntry(
+  id: '7',
+  userId: 'user-1',
   title: 'Chilaquiles',
-  category: 'Desayuno',
+  categoryId: _desayuno.id,
+  categoryName: _desayuno.name,
   prepTime: '20 min',
-  ingredients: 'Totopos\n\nSalsa verde',
+  ingredients: Ingredient.fromLines('7', 'Totopos\n\nSalsa verde'),
   instructions: 'Calentar la salsa\nAgregar totopos',
-  imagePath: '',
-  isFavorite: 1,
-  createdAt: '2026-11-12T10:00:00.000',
+  isFavorite: true,
+  createdAt: _created,
+  updatedAt: _created,
+  syncStatus: SyncStatus.synced,
 );
 
 /// Repositorio en memoria: demuestra que la UI no depende de SQLite (DIP).
@@ -42,18 +54,33 @@ class _FakeRepository implements RecipeRepository {
       _result(recipes.where((r) => r.favorite).toList());
 
   @override
-  Future<List<RecipeEntry>> getRecipesByCategory(String category) =>
-      _result(recipes.where((r) => r.category == category).toList());
+  Future<List<RecipeCategory>> getCategories() async => kDefaultCategories;
 
   @override
-  Future<int> insertRecipe(RecipeEntry recipe) async => 1;
+  Future<List<RecipeEntry>> getRecipesByCategory(String categoryId) =>
+      _result(recipes.where((r) => r.categoryId == categoryId).toList());
 
   @override
-  Future<int> toggleFavorite(int id, int currentValue) async =>
-      currentValue == 1 ? 0 : 1;
+  String? get currentUserId => 'user-1';
 
   @override
-  Future<int> deleteRecipe(int id) async => 1;
+  Future<RecipeEntry> saveRecipe(RecipeEntry recipe) async => recipe;
+
+  @override
+  Future<RecipeEntry> toggleFavorite(RecipeEntry recipe) async =>
+      recipe.copyWith(isFavorite: !recipe.isFavorite);
+
+  @override
+  Future<void> deleteRecipe(String id) async {}
+
+  @override
+  Future<void> syncAll() async {}
+
+  @override
+  final ValueListenable<SyncState> syncState = ValueNotifier(const SyncState());
+
+  @override
+  Stream<void> get remoteChanges => const Stream.empty();
 }
 
 /// Motor de voz falso que registra lo que se le pide leer.
@@ -77,9 +104,67 @@ class _FakeSpeechOutput implements SpeechOutput {
 void main() {
   group('RecipeEntry', () {
     test('toMap/fromMap conserva todos los campos', () {
-      final copy = RecipeEntry.fromMap(_recipe.toMap());
+      final copy = RecipeEntry.fromMap(
+        _recipe.toMap(),
+        ingredients: _recipe.ingredients,
+      );
       expect(copy.toMap(), _recipe.toMap());
+      expect(copy.ingredientList, ['Totopos', 'Salsa verde']);
       expect(copy.heroTag, 'recipe-hero-7');
+      // Los ingredientes viven en su propia tabla, no en la fila de recipes.
+      expect(_recipe.toMap().containsKey('ingredients'), isFalse);
+      expect(_recipe.toMap()['category_id'], _desayuno.id);
+    });
+
+    test('Ingredient.fromLines ignora líneas vacías y numera posiciones', () {
+      final list = Ingredient.fromLines('r1', ' Harina \n\nAzúcar\r\nHuevo');
+      expect(list.map((i) => i.name), ['Harina', 'Azúcar', 'Huevo']);
+      expect(list.map((i) => i.position), [0, 1, 2]);
+      expect(list.every((i) => i.recipeId == 'r1'), isTrue);
+    });
+
+    test('fromSupabaseMap lee los ingredientes embebidos', () {
+      final remote = RecipeEntry.fromSupabaseMap({
+        ..._recipe.toSupabaseMap(),
+        'ingredients': [
+          {'id': 'b', 'recipe_id': '7', 'position': 1, 'name': 'Salsa'},
+          {'id': 'a', 'recipe_id': '7', 'position': 0, 'name': 'Totopos'},
+        ],
+      });
+      expect(remote.ingredientList, ['Totopos', 'Salsa']);
+      expect(remote.categoryId, _desayuno.id);
+    });
+
+    test('toSupabaseMap excluye campos locales y fromSupabaseMap marca '
+        'synced', () {
+      final withImage = _recipe.copyWith(
+        imagePath: '/local/foto.jpg',
+        imageUrl: 'https://example.com/foto.jpg',
+        syncStatus: SyncStatus.pending,
+      );
+      final remote = withImage.toSupabaseMap();
+      expect(remote.containsKey('image_path'), isFalse);
+      expect(remote.containsKey('sync_status'), isFalse);
+      expect(remote['is_favorite'], isTrue);
+
+      final back = RecipeEntry.fromSupabaseMap(remote);
+      expect(back.imagePath, isNull);
+      expect(back.imageUrl, 'https://example.com/foto.jpg');
+      expect(back.syncStatus, SyncStatus.synced);
+      expect(back.updatedAt, withImage.updatedAt);
+    });
+
+    test('newId genera UUID v4 únicos', () {
+      final a = RecipeEntry.newId();
+      final b = RecipeEntry.newId();
+      expect(a, isNot(b));
+      expect(
+        RegExp(
+          r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-'
+          r'[0-9a-f]{12}$',
+        ).hasMatch(a),
+        isTrue,
+      );
     });
 
     test('separa ingredientes y pasos ignorando líneas vacías', () {
@@ -144,15 +229,17 @@ void main() {
   testWidgets('Los filtros del Drawer consultan y muestran su estado vacío', (
     tester,
   ) async {
-    const notFavorite = RecipeEntry(
-      id: 8,
+    final notFavorite = RecipeEntry(
+      id: '8',
+      userId: 'user-1',
       title: 'Agua de jamaica',
-      category: 'Bebida',
+      categoryId: _bebida.id,
+      categoryName: _bebida.name,
       prepTime: '10 min',
-      ingredients: 'Jamaica',
+      ingredients: Ingredient.fromLines('8', 'Jamaica'),
       instructions: 'Hervir',
-      imagePath: '',
-      createdAt: '2026-11-12T11:00:00.000',
+      createdAt: _created,
+      updatedAt: _created,
     );
     final repo = _FakeRepository([_recipe, notFavorite]);
     await tester.pumpWidget(MaterialApp(home: HomeScreen(repository: repo)));
